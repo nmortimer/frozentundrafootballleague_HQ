@@ -1131,3 +1131,5 @@ feed. Each card has a deal type:
 Team page edit mode: **Delete** on app-entered contracts (`fa-`/`new-`
 ids) removes a mistaken entry outright — no buyout. Imported contracts
 still only have Cut.
+
+test
