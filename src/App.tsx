@@ -307,6 +307,12 @@ function ActivityReview({
     if (result.ok) runRosterCheck();
   }
 
+  function fillPositions() {
+    const fixes = new Map((rosterCheck?.missingPositions ?? []).map((m) => [m.contractId, m.position]));
+    const updated = contracts.map((c) => (fixes.has(c.id) ? { ...c, position: fixes.get(c.id)! } : c));
+    saveAndRecheck(updated, `Filled positions for ${fixes.size} contract(s).`);
+  }
+
   // Mismatch fix 1: a real trade — same contract, new team.
   function resolveAsTrade(m: RosterCheck['mismatches'][number]) {
     const updated = contracts.map((c) => (c.id === m.contractId ? { ...c, team: m.fleaflickerTeam } : c));
@@ -336,7 +342,10 @@ function ActivityReview({
   }
 
   const findContract = (playerName: string) =>
-    contracts.find((c) => normalizePlayerName(c.playerName) === normalizePlayerName(playerName) && salaryInYear(c, year) != null);
+    // Buyouts don't count: a buyout is dead money for the team that cut
+    // him, not a roster spot. Counting them hid anyone re-signed after
+    // being cut (Jordan Mason: Soldiers buyout through 2026, now on Osos).
+    contracts.find((c) => c.kind !== 'buyout' && normalizePlayerName(c.playerName) === normalizePlayerName(playerName) && salaryInYear(c, year) != null);
 
   const logItems = (activity ?? []).filter((a) => a.kind === 'transaction' && a.playerName && !findContract(a.playerName));
   // Rostered players with no contract anywhere, from the roster check —
@@ -590,6 +599,17 @@ function ActivityReview({
             </button>
           </div>
         ))}
+        {rosterCheck && (rosterCheck.missingPositions ?? []).length > 0 && (
+          <div className="add-form-row">
+            <span>
+              {rosterCheck.missingPositions!.length} contract(s) have no position, so they don't show in any position
+              section on the team sheet.
+            </span>
+            <button className="btn-tiny" onClick={fillPositions} disabled={saving}>
+              Fill missing positions from Fleaflicker
+            </button>
+          </div>
+        )}
         {rosterCheck && rosterCheck.notOnRoster.length > 0 && (
           <p className="sync-line">
             On file but not on any Fleaflicker roster:{' '}
@@ -990,6 +1010,20 @@ function TeamPage({
             </section>
           );
         })}
+      {/* Contracts with a blank/unknown position used to match no section
+          and silently disappear from the sheet (Devin Neal — imported with
+          position ''). Shown here until positions are filled in. */}
+      {(() => {
+        const rows = active.filter((r) => !POSITIONS.includes(r.contract.position));
+        if (rows.length === 0) return null;
+        return (
+          <section className="roster-section">
+            <h2 className="section-title">Position missing</h2>
+            <p className="section-note">Fill these from FA review → Team check → "Fill missing positions".</p>
+            {rowTable(rows)}
+          </section>
+        );
+      })()}
       </div>
 
       <div className="team-page-right">
