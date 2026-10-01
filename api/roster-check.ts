@@ -59,6 +59,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .filter((c) => !rosterMap.has(normalize(c.playerName)))
     .map((c) => ({ contractId: c.id, playerName: c.playerName, sheetTeam: c.team }));
 
+  // Contracts with a blank/invalid position, where Fleaflicker has one
+  // for that rostered player — offered as a one-click fill.
+  const VALID = ['QB', 'RB', 'WR', 'TE'];
+  const missingPositions = contracts
+    .filter((c) => !VALID.includes(c.position))
+    .map((c) => ({ c, pos: rosterMap.get(normalize(c.playerName))?.position }))
+    .filter((x): x is { c: typeof x.c; pos: string } => Boolean(x.pos && VALID.includes(x.pos)))
+    .map(({ c, pos }) => ({ contractId: c.id, playerName: c.playerName, position: pos }));
+
   res.setHeader('Cache-Control', 'no-store');
-  return res.status(200).json({ year, unsigned, mismatches, notOnRoster });
+  return res.status(200).json({ year, unsigned, mismatches, notOnRoster, missingPositions });
 }
