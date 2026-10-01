@@ -1,10 +1,18 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getJSON, setJSON } from './_lib/store.js';
 import { teams } from '../src/data/teams.js';
+import { currentNflSeason } from './compute-league-history.js';
 
 const START_SEASON = 2018;
 const TOP_SCORERS_KEY = 'ftfl:top-scorers';
-const RAW_KEY = 'ftfl:top-scorers-raw';
+const RAW_KEY = 'ftfl:top-scorers-raw'; // FINISHED seasons only, accumulated once each
+// The in-progress season, rebuilt from scratch on every weekly run and
+// kept separate — adding it into RAW_KEY each week would double-count.
+const CURRENT_KEY = 'ftfl:top-scorers-current';
+interface CurrentState {
+  season: number;
+  totals: Record<number, Record<string, Record<string, number>>>;
+}
 const POSITIONS = ['QB', 'RB', 'WR', 'TE'];
 
 function sleep(ms: number) {
@@ -92,9 +100,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'FLEAFLICKER_LEAGUE_ID is not set on the server.' });
   }
 
-  const throughSeason = Number(req.query.through) || new Date().getFullYear();
+  const currentSeason = currentNflSeason();
+  const throughSeason = Number(req.query.through) || currentSeason;
   const allSeasons: number[] = [];
   for (let y = START_SEASON; y <= throughSeason; y++) allSeasons.push(y);
+  // mode=current (weekly cron): first fill any FINISHED season missing
+  // from RAW_KEY (one per run, e.g. last season right after it ends),
+  // otherwise rebuild the current season into CURRENT_KEY.
+  const currentOnly = req.query.mode === 'current';
 
   const knownIds = new Set(teams.map((t) => t.fleaflickerId));
 
@@ -109,17 +122,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // The current season can't live in RAW_KEY (it's still changing). If an
+  // earlier manual run put it there, its partial points are mixed in and
+  // can't be separated — refuse rather than double-count.
+  if (raw.processedSeasons.includes(currentSeason) && req.query.reset !== '1') {
+    return res.status(409).json({
+      error: `Season ${currentSeason} is in progress but was already added to the finished-season totals by an earlier manual run, so a weekly refresh would double-count it. One-time fix: visit /api/compute-top-scorers?reset=1, then keep visiting /api/compute-top-scorers (no params) until it says complete, then /api/compute-top-scorers?mode=current once.`,
+    });
+  }
+
+  const finishedSeasons = allSeasons.filter((y) => y < currentSeason);
   const requestedSeason = Number(req.query.season) || null;
-  const season = requestedSeason ?? allSeasons.find((s) => !raw.processedSeasons.includes(s));
+  const missingFinished = finishedSeasons.find((y) => !raw.processedSeasons.includes(y));
+  const season = requestedSeason ?? (currentOnly ? (missingFinished ?? currentSeason) : missingFinished);
+  const isCurrent = season === currentSeason;
+  if (requestedSeason && isCurrent && !currentOnly) {
+    return res.status(400).json({ error: `Season ${season} is in progress — use ?mode=current (the weekly cron does this).` });
+  }
+  let current: CurrentState | null = await getJSON<CurrentState>(CURRENT_KEY);
+  if (current && current.season !== currentSeason) current = null; // stale — that season is now "finished" and handled via RAW_KEY
+  // Points for the current season go into a fresh map, not RAW_KEY.
+  const target: CurrentState['totals'] = isCurrent ? {} : raw.totals;
+  if (isCurrent) {
+    for (const t of teams) {
+      target[t.fleaflickerId] = {};
+      for (const p of POSITIONS) target[t.fleaflickerId][p] = {};
+    }
+  }
 
   if (!season) {
-    const summary = summarize(raw, throughSeason);
+    const summary = summarize(raw, throughSeason, current);
     return res.status(200).json({ ok: true, alreadyComplete: true, processedSeasons: raw.processedSeasons, summary });
   }
 
   function addPoints(teamId: number, position: string, playerName: string, points: number) {
     if (!knownIds.has(teamId) || !POSITIONS.includes(position) || !points) return;
-    const byPos = raw.totals[teamId];
+    const byPos = target[teamId];
     byPos[position][playerName] = (byPos[position][playerName] ?? 0) + points;
   }
 
@@ -224,14 +262,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     let pointsFoundThisSeason = 0;
-    for (const teamTotals of Object.values(raw.totals)) {
+    for (const teamTotals of Object.values(target)) {
       for (const byName of Object.values(teamTotals)) {
         pointsFoundThisSeason += Object.values(byName).reduce((a, b) => a + b, 0);
       }
     }
 
-    if (!raw.processedSeasons.includes(season)) raw.processedSeasons.push(season);
-    raw.processedSeasons.sort((a, b) => a - b);
+    if (isCurrent) {
+      current = { season, totals: target };
+    } else {
+      if (!raw.processedSeasons.includes(season)) raw.processedSeasons.push(season);
+      raw.processedSeasons.sort((a, b) => a - b);
+    }
 
     if (gameRefs.length > 0 && pointsFoundThisSeason === 0 && raw.processedSeasons.length <= 1) {
       return res.status(502).json({
@@ -241,11 +283,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    await setJSON(RAW_KEY, raw);
-    const summary = summarize(raw, throughSeason);
+    if (isCurrent) await setJSON(CURRENT_KEY, current);
+    else await setJSON(RAW_KEY, raw);
+    const summary = summarize(raw, throughSeason, current);
     await setJSON(TOP_SCORERS_KEY, summary);
 
-    const remaining = allSeasons.filter((s) => !raw.processedSeasons.includes(s));
+    const remaining = finishedSeasons.filter((s) => !raw.processedSeasons.includes(s));
     return res.status(200).json({
       ok: true,
       processedThisCall: season,
@@ -260,11 +303,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 }
 
-function summarize(raw: RawState, throughSeason: number): TopScorersResult {
+function summarize(raw: RawState, throughSeason: number, current: CurrentState | null): TopScorersResult {
   const teamTopScorers: TeamTopScorers[] = teams.map((t) => {
     const byPos = raw.totals[t.fleaflickerId] ?? {};
+    const curPos = current?.totals[t.fleaflickerId] ?? {};
     const scorers: TopScorer[] = POSITIONS.map((position) => {
-      const byName = byPos[position] ?? {};
+      // finished seasons + the in-progress season, merged per player
+      const byName: Record<string, number> = { ...(byPos[position] ?? {}) };
+      for (const [n, pts] of Object.entries(curPos[position] ?? {})) byName[n] = (byName[n] ?? 0) + pts;
       let best: { playerName: string; totalPoints: number } | null = null;
       for (const [playerName, totalPoints] of Object.entries(byName)) {
         if (!best || totalPoints > best.totalPoints) best = { playerName, totalPoints };
