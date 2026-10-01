@@ -1,10 +1,27 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { setJSON } from './_lib/store.js';
+import { getJSON, setJSON } from './_lib/store.js';
 import { teams } from '../src/data/teams.js';
 import type { LeagueHistory, TeamHistory, PostseasonFinish, HeadToHead } from '../src/lib/leagueHistory';
 
 const START_SEASON = 2018; // confirmed: the league's real first season on Fleaflicker
 const HISTORY_KEY = 'ftfl:league-history';
+// Per-season results, so the weekly cron only re-fetches the current
+// season (finished seasons never change). Aggregated into HISTORY_KEY.
+const SEASONS_KEY = 'ftfl:league-history-seasons';
+
+/** NFL season year: Jan/Feb games belong to the previous year's season. */
+export function currentNflSeason(now = new Date()): number {
+  return now.getMonth() < 2 ? now.getFullYear() - 1 : now.getFullYear();
+}
+
+type Rec = { wins: number; losses: number; ties: number };
+interface SeasonPartial {
+  complete: boolean; // championship game found
+  totals: Record<number, Rec & { pointsFor: number; pointsAgainst: number }>;
+  h2h: Record<number, Record<number, Rec>>;
+  postseason: { id: number; finish: PostseasonFinish }[];
+  lastPlace: { id: number; season: number; teamNameThatYear: string } | null;
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -71,124 +88,128 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'FLEAFLICKER_LEAGUE_ID is not set on the server.' });
   }
 
-  const throughSeason = Number(req.query.through) || new Date().getFullYear();
+  const throughSeason = Number(req.query.through) || currentNflSeason();
   const seasons: number[] = [];
   for (let y = START_SEASON; y <= throughSeason; y++) seasons.push(y);
+  // mode=current (the weekly cron): reuse cached finished seasons, only
+  // re-fetch the current season plus any season not cached/complete yet.
+  // No mode: full rebuild of every season, same as before.
+  const currentOnly = req.query.mode === 'current';
 
   const knownIds = new Set(teams.map((t) => t.fleaflickerId));
-  const idToSlug = new Map(teams.map((t) => [t.fleaflickerId, t.slug]));
 
-  const allTime = new Map(teams.map((t) => [t.fleaflickerId, { wins: 0, losses: 0, ties: 0, pointsFor: 0, pointsAgainst: 0 }]));
-  const h2h = new Map(teams.map((t) => [t.fleaflickerId, new Map<number, { wins: number; losses: number; ties: number }>()]));
-  const postseasonByTeam = new Map(teams.map((t) => [t.fleaflickerId, [] as PostseasonFinish[]]));
-  const lastPlaceByTeam = new Map(teams.map((t) => [t.fleaflickerId, [] as { season: number; teamNameThatYear: string }[]]));
-  const incompleteSeasons: number[] = [];
+  async function computeSeason(season: number): Promise<SeasonPartial> {
+    const p: SeasonPartial = { complete: false, totals: {}, h2h: {}, postseason: [], lastPlace: null };
+    const h2hFor = (id: number, opp: number) => {
+      p.h2h[id] ??= {};
+      return (p.h2h[id][opp] ??= { wins: 0, losses: 0, ties: 0 });
+    };
 
-  function h2hFor(id: number, opponentId: number) {
-    const m = h2h.get(id)!;
-    if (!m.has(opponentId)) m.set(opponentId, { wins: 0, losses: 0, ties: 0 });
-    return m.get(opponentId)!;
+    const standingsRes = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueStandings?sport=NFL&league_id=${leagueId}&season=${season}`);
+    if (!standingsRes.ok) throw new Error(`Standings failed for season ${season} (HTTP ${standingsRes.status})`);
+    const standingsData: any = await standingsRes.json();
+    const seasonTeams: any[] = (standingsData?.divisions ?? []).flatMap((d: any) => d?.teams ?? []);
+    const snapshot: { id: number; wins: number; pointsFor: number; name: string }[] = [];
+    for (const t of seasonTeams) {
+      if (!knownIds.has(t.id)) continue;
+      const rec = t.recordOverall ?? {};
+      p.totals[t.id] = {
+        wins: rec.wins ?? 0,
+        losses: rec.losses ?? 0,
+        ties: rec.ties ?? 0,
+        pointsFor: t.pointsFor?.value ?? 0,
+        pointsAgainst: t.pointsAgainst?.value ?? 0,
+      };
+      snapshot.push({ id: t.id, wins: rec.wins ?? 0, pointsFor: t.pointsFor?.value ?? 0, name: t.name });
+    }
+
+    const firstWeekRes = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueScoreboard?sport=NFL&league_id=${leagueId}&season=${season}&scoring_period=1`);
+    if (!firstWeekRes.ok) throw new Error(`Scoreboard discovery failed for season ${season} (HTTP ${firstWeekRes.status})`);
+    const firstWeekData: any = await firstWeekRes.json();
+    const eligiblePeriods: number[] = (firstWeekData?.eligibleSchedulePeriods ?? []).map((x: any) => x.ordinal).filter((n: any) => typeof n === 'number');
+    const maxWeek = eligiblePeriods.length > 0 ? Math.max(...eligiblePeriods) : 1;
+    const weekResults = await Promise.all(
+      Array.from({ length: maxWeek }, (_, i) => i + 1).map(async (week) => {
+        if (week === 1) return firstWeekData;
+        const r = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueScoreboard?sport=NFL&league_id=${leagueId}&season=${season}&scoring_period=${week}`);
+        if (!r.ok) throw new Error(`Scoreboard failed for season ${season} week ${week} (HTTP ${r.status})`);
+        return r.json();
+      }),
+    );
+
+    for (const weekData of weekResults) {
+      for (const g of (weekData?.games ?? []) as any[]) {
+        const awayId = g?.away?.id;
+        const homeId = g?.home?.id;
+        if (!knownIds.has(awayId) || !knownIds.has(homeId)) continue;
+        if (g?.isFinalScore) {
+          const a = h2hFor(awayId, homeId);
+          const h = h2hFor(homeId, awayId);
+          if (g.awayResult === 'WIN') { a.wins++; h.losses++; }
+          else if (g.awayResult === 'LOSE') { a.losses++; h.wins++; }
+          else if (g.awayResult === 'TIE') { a.ties++; h.ties++; }
+        }
+        if (g?.isChampionshipGame || g?.isThirdPlaceGame) {
+          // Only count a decided game — an unplayed title game has no result yet.
+          if (g.awayResult !== 'WIN' && g.awayResult !== 'LOSE') continue;
+          const awayWon = g.awayResult === 'WIN';
+          const top: 1 | 3 = g.isChampionshipGame ? 1 : 3;
+          p.postseason.push({ id: awayWon ? awayId : homeId, finish: { season, place: top, teamNameThatYear: awayWon ? g.away.name : g.home.name } });
+          p.postseason.push({ id: awayWon ? homeId : awayId, finish: { season, place: (top + 1) as 2 | 4, teamNameThatYear: awayWon ? g.home.name : g.away.name } });
+          if (g.isChampionshipGame) p.complete = true;
+        }
+      }
+    }
+
+    if (p.complete) {
+      let worst: (typeof snapshot)[number] | null = null;
+      for (const x of snapshot) {
+        if (!worst || x.wins < worst.wins || (x.wins === worst.wins && x.pointsFor < worst.pointsFor)) worst = x;
+      }
+      if (worst) p.lastPlace = { id: worst.id, season, teamNameThatYear: worst.name };
+    }
+    return p;
   }
 
   try {
+    const cached = (currentOnly ? await getJSON<Record<number, SeasonPartial>>(SEASONS_KEY) : null) ?? {};
+    const partials: Record<number, SeasonPartial> = {};
+    const fetched: number[] = [];
     for (const season of seasons) {
-      const standingsRes = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueStandings?sport=NFL&league_id=${leagueId}&season=${season}`);
-      if (!standingsRes.ok) throw new Error(`Standings failed for season ${season} (HTTP ${standingsRes.status})`);
-      const standingsData: any = await standingsRes.json();
-      const seasonTeams: any[] = (standingsData?.divisions ?? []).flatMap((d: any) => d?.teams ?? []);
-
-      // per-season snapshot, used later to determine that season's last place —
-      // only once we know (below) whether the season actually finished
-      const seasonSnapshot: { id: number; wins: number; pointsFor: number; name: string }[] = [];
-
-      for (const t of seasonTeams) {
-        if (!knownIds.has(t.id)) continue; // defensive — shouldn't happen for a stable 10-team league
-        const rec = t.recordOverall ?? {};
-        const agg = allTime.get(t.id)!;
-        agg.wins += rec.wins ?? 0;
-        agg.losses += rec.losses ?? 0;
-        agg.ties += rec.ties ?? 0;
-        agg.pointsFor += t.pointsFor?.value ?? 0;
-        agg.pointsAgainst += t.pointsAgainst?.value ?? 0;
-        seasonSnapshot.push({ id: t.id, wins: rec.wins ?? 0, pointsFor: t.pointsFor?.value ?? 0, name: t.name });
-      }
-
-      // discover this season's real week range from the scoreboard's own eligibleSchedulePeriods
-      const firstWeekRes = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueScoreboard?sport=NFL&league_id=${leagueId}&season=${season}&scoring_period=1`);
-      if (!firstWeekRes.ok) throw new Error(`Scoreboard discovery failed for season ${season} (HTTP ${firstWeekRes.status})`);
-      const firstWeekData: any = await firstWeekRes.json();
-      const eligiblePeriods: number[] = (firstWeekData?.eligibleSchedulePeriods ?? []).map((p: any) => p.ordinal).filter((n: any) => typeof n === 'number');
-      const maxWeek = eligiblePeriods.length > 0 ? Math.max(...eligiblePeriods) : 1;
-
-      const weekResults = await Promise.all(
-        Array.from({ length: maxWeek }, (_, i) => i + 1).map(async (week) => {
-          if (week === 1) return firstWeekData; // already fetched above, don't re-fetch
-          const r = await fetchWithRetry(`https://www.fleaflicker.com/api/FetchLeagueScoreboard?sport=NFL&league_id=${leagueId}&season=${season}&scoring_period=${week}`);
-          if (!r.ok) throw new Error(`Scoreboard failed for season ${season} week ${week} (HTTP ${r.status})`);
-          return r.json();
-        })
-      );
-
-      let foundChampionship = false;
-
-      for (const weekData of weekResults) {
-        const games: any[] = weekData?.games ?? [];
-        for (const g of games) {
-          const awayId = g?.away?.id;
-          const homeId = g?.home?.id;
-          if (!knownIds.has(awayId) || !knownIds.has(homeId)) continue;
-
-          if (g?.isFinalScore) {
-            const awayResult = g?.awayResult;
-            const homeResult = g?.homeResult;
-            const awayRec = h2hFor(awayId, homeId);
-            const homeRec = h2hFor(homeId, awayId);
-            if (awayResult === 'WIN') {
-              awayRec.wins += 1;
-              homeRec.losses += 1;
-            } else if (awayResult === 'LOSE') {
-              awayRec.losses += 1;
-              homeRec.wins += 1;
-            } else if (awayResult === 'TIE') {
-              awayRec.ties += 1;
-              homeRec.ties += 1;
-            }
-          }
-
-          if (g?.isChampionshipGame) {
-            foundChampionship = true;
-            const winnerId = g.awayResult === 'WIN' ? awayId : homeId;
-            const loserId = g.awayResult === 'WIN' ? homeId : awayId;
-            const winnerName = g.awayResult === 'WIN' ? g.away.name : g.home.name;
-            const loserName = g.awayResult === 'WIN' ? g.home.name : g.away.name;
-            postseasonByTeam.get(winnerId)!.push({ season, place: 1, teamNameThatYear: winnerName });
-            postseasonByTeam.get(loserId)!.push({ season, place: 2, teamNameThatYear: loserName });
-          }
-
-          if (g?.isThirdPlaceGame) {
-            const winnerId = g.awayResult === 'WIN' ? awayId : homeId;
-            const loserId = g.awayResult === 'WIN' ? homeId : awayId;
-            const winnerName = g.awayResult === 'WIN' ? g.away.name : g.home.name;
-            const loserName = g.awayResult === 'WIN' ? g.home.name : g.away.name;
-            postseasonByTeam.get(winnerId)!.push({ season, place: 3, teamNameThatYear: winnerName });
-            postseasonByTeam.get(loserId)!.push({ season, place: 4, teamNameThatYear: loserName });
-          }
-        }
-      }
-
-      if (foundChampionship) {
-        let worst: { id: number; wins: number; pointsFor: number; name: string } | null = null;
-        for (const s of seasonSnapshot) {
-          if (!worst || s.wins < worst.wins || (s.wins === worst.wins && s.pointsFor < worst.pointsFor)) {
-            worst = s;
-          }
-        }
-        if (worst) {
-          lastPlaceByTeam.get(worst.id)!.push({ season, teamNameThatYear: worst.name });
-        }
+      const c = cached[season];
+      if (c && c.complete && season < throughSeason) {
+        partials[season] = c;
       } else {
-        incompleteSeasons.push(season);
+        partials[season] = await computeSeason(season); // sequential — rate-limit margin
+        fetched.push(season);
       }
+    }
+    await setJSON(SEASONS_KEY, partials);
+
+    const allTime = new Map(teams.map((t) => [t.fleaflickerId, { wins: 0, losses: 0, ties: 0, pointsFor: 0, pointsAgainst: 0 }]));
+    const h2h = new Map(teams.map((t) => [t.fleaflickerId, new Map<number, Rec>()]));
+    const postseasonByTeam = new Map(teams.map((t) => [t.fleaflickerId, [] as PostseasonFinish[]]));
+    const lastPlaceByTeam = new Map(teams.map((t) => [t.fleaflickerId, [] as { season: number; teamNameThatYear: string }[]]));
+    const incompleteSeasons: number[] = [];
+    for (const season of seasons) {
+      const p = partials[season];
+      for (const [id, t] of Object.entries(p.totals)) {
+        const agg = allTime.get(Number(id));
+        if (!agg) continue;
+        agg.wins += t.wins; agg.losses += t.losses; agg.ties += t.ties;
+        agg.pointsFor += t.pointsFor; agg.pointsAgainst += t.pointsAgainst;
+      }
+      for (const [id, opps] of Object.entries(p.h2h)) {
+        const m = h2h.get(Number(id));
+        if (!m) continue;
+        for (const [opp, r] of Object.entries(opps)) {
+          const cur = m.get(Number(opp)) ?? { wins: 0, losses: 0, ties: 0 };
+          m.set(Number(opp), { wins: cur.wins + r.wins, losses: cur.losses + r.losses, ties: cur.ties + r.ties });
+        }
+      }
+      for (const { id, finish } of p.postseason) postseasonByTeam.get(id)?.push(finish);
+      if (p.lastPlace) lastPlaceByTeam.get(p.lastPlace.id)?.push({ season: p.lastPlace.season, teamNameThatYear: p.lastPlace.teamNameThatYear });
+      if (!p.complete) incompleteSeasons.push(season);
     }
 
     const teamHistories: TeamHistory[] = teams.map((t) => {
@@ -220,7 +241,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json({
       ok: true,
-      message: `Computed history for ${seasons.length} seasons (${START_SEASON}-${throughSeason}).`,
+      message: `History updated for ${START_SEASON}-${throughSeason}; fetched from Fleaflicker: ${fetched.join(', ') || 'none'}.`,
+      fetchedSeasons: fetched,
       incompleteSeasons,
       teamCount: teamHistories.length,
     });
