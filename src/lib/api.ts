@@ -278,6 +278,7 @@ export interface RosterCheck {
   unsigned: { playerName: string; team: string; position?: string; isTaxi?: boolean; isIR?: boolean }[];
   mismatches: { contractId: string; playerName: string; sheetTeam: string; fleaflickerTeam: string }[];
   notOnRoster: { contractId: string; playerName: string; sheetTeam: string }[];
+  missingPositions?: { contractId: string; playerName: string; position: string }[];
 }
 
 /** Read-only roster-vs-contracts check (api/roster-check.ts). */
